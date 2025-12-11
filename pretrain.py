@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 import copy
+import json
 
 import torch
 import torch.distributed as dist
@@ -17,12 +18,14 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
+# from adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class LossConfig(pydantic.BaseModel):
@@ -127,7 +130,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
+    with torch.device(DEVICE):
         model: nn.Module = model_cls(model_cfg)
         print(model)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
@@ -147,7 +150,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Optimizers and lr
     if config.arch.puzzle_emb_ndim == 0:
         optimizers = [
-            AdamATan2(
+            torch.optim.AdamW(
                 model.parameters(),
                 lr=0,  # Needs to be set by scheduler
                 weight_decay=config.weight_decay,
@@ -177,7 +180,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
             ),
-            AdamATan2(
+            torch.optim.AdamW(
                 model.parameters(),
                 lr=0,  # Needs to be set by scheduler
                 weight_decay=config.weight_decay,
@@ -246,7 +249,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
         print(f"Loading checkpoint {config.load_checkpoint}")
 
         # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        state_dict = torch.load(config.load_checkpoint, map_location=DEVICE)
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
@@ -292,11 +295,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    batch = {k: v.to(DEVICE) for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        with torch.device(DEVICE):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
@@ -377,8 +380,8 @@ def evaluate(
                 print(f"Processing batch {processed_batches}: {set_name}")
             
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
+            batch = {k: v.to(DEVICE) for k, v in batch.items()}
+            with torch.device(DEVICE):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -414,7 +417,7 @@ def evaluate(
                     sorted(metrics.keys())
                 )  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
+                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device=DEVICE
                 )
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
@@ -595,6 +598,8 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
+    print(vars(config))
+
     # Training Loop
     for _iter_id in range(total_iters):
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
@@ -608,9 +613,12 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+            progress_bar.update(train_state.step - progress_bar.n)  # type: 
+
             if config.ema:
                 ema_helper.update(train_state.model)
+
+
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
@@ -635,7 +643,7 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 
-            ############ Checkpointing
+            ########### Checkpointing
             if RANK == 0:
                 print("SAVE CHECKPOINT")
             if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):

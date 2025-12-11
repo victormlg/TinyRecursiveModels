@@ -193,6 +193,8 @@ class PuzzleDataset(IterableDataset):
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
                 })
 
+                print(batch)
+
                 yield set_name, batch, end_index - start_index
                 
                 # Advance to next batch
